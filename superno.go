@@ -1,11 +1,8 @@
-// super_node.go
 package main
 
 import (
 	"fmt"
-	"io"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -13,9 +10,9 @@ import (
 )
 
 var (
-	files         = make(map[string][]string)
+	files         = make(map[string]string) // Armazena o nome do arquivo e o IP do cliente que o possui
 	superNodeID   = "SuperNode1"
-	coordinatorIP = "192.168.100.11" // IP do master_node (modifique para o IP correto)
+	coordinatorIP = "172.26.4.220" // IP do master_node (modifique para o IP correto)
 	coordinatorID = "Master"
 	allSuperNodes = []string{"SuperNode1", "SuperNode2", "SuperNode3"}
 
@@ -23,113 +20,88 @@ var (
 )
 
 func handleUpload(conn net.Conn, fileName string) {
-	defer conn.Close() // Fecha a conexão ao final
 	baseFileName := filepath.Base(fileName)
 
 	// Captura o IP do cliente
 	ipClient := strings.Split(conn.RemoteAddr().String(), ":")[0]
 
+	// Log para rastrear o início do upload
+	fmt.Printf("Iniciando upload do arquivo '%s' do cliente %s\n", baseFileName, ipClient)
+
 	// Bloqueia o acesso ao mapa antes de modificar
 	mu.Lock()
-	if files[baseFileName] == nil {
-		files[baseFileName] = []string{}
-	}
-
-	files[baseFileName] = append(files[baseFileName], ipClient, fileName)
+	files[baseFileName] = ipClient // Armazena o IP do cliente, substituindo o valor antigo (se houver)
 	mu.Unlock() // Desbloqueia o mapa após a modificação
 
-	// Exibe os arquivos armazenados
-	fmt.Println(files)
+	// Exibe os arquivos armazenados para conferência
+	fmt.Printf("Arquivo '%s' registrado com o cliente %s. Estado atual dos arquivos: %v\n", baseFileName, ipClient, files)
 
-	// Envia a confirmação de upload para o cliente
-	if _, err := fmt.Fprintf(conn, "Upload concluído\n"); err != nil {
-		fmt.Printf("Erro ao enviar resposta para o cliente: %v\n", err)
+	// Envia a confirmação de upload para o cliente e verifica se houve erro
+	if _, err := fmt.Fprintf(conn, "Upload registrado no super nó.\n"); err != nil {
+		fmt.Printf("Erro ao enviar resposta de confirmação ao cliente %s: %v\n", ipClient, err)
+		return
 	}
-	fmt.Printf("Arquivo '%s' armazenado no servidor com caminho.\n", baseFileName)
+
+	fmt.Printf("Upload do arquivo '%s' do cliente %s concluído com sucesso.\n", baseFileName, ipClient)
 }
 
 func handleDownload(conn net.Conn, fileName string) {
-	defer conn.Close() // Garante que a conexão será fechada no final
 
 	baseFileName := filepath.Base(fileName)
 
 	// Bloqueia o acesso ao mapa antes de ler
 	mu.Lock()
-	fileInfo, exists := files[baseFileName]
+	ipClient, exists := files[baseFileName] // Pega o IP do cliente que possui o arquivo
 	mu.Unlock()
 
-	if !exists || len(fileInfo) < 2 {
-		// Verifica se o arquivo existe e se o caminho está presente no slice
+	if !exists {
+		// Verifica se o arquivo está registrado
 		fmt.Fprintf(conn, "ERROR: Arquivo '%s' não encontrado\n", baseFileName)
 		fmt.Printf("Arquivo '%s' solicitado, mas não encontrado no servidor.\n", baseFileName)
 		return
 	}
 
-	// O segundo elemento do slice 'fileInfo' contém o caminho completo do arquivo
-	filePath := fileInfo[1]
+	// Envia o IP do cliente que possui o arquivo
+	fmt.Fprintf(conn, "O arquivo '%s' está disponível no cliente com IP: %s\n", baseFileName, ipClient)
+	fmt.Printf("Informações do arquivo '%s' enviadas para o cliente solicitante.\n", baseFileName)
 
-	file, err := os.Open(filePath)
-	if err != nil {
-		fmt.Fprintf(conn, "ERROR: Erro ao abrir arquivo: %v\n", err)
-		fmt.Printf("Erro ao abrir o arquivo '%s' para download: %v\n", baseFileName, err)
-		return
-	}
-	defer file.Close()
-
-	// Obtenção de informações do arquivo
-	fileInfoStat, err := file.Stat()
-	if err != nil {
-		fmt.Fprintf(conn, "ERROR: Erro ao obter informações do arquivo: %v\n", err)
-		fmt.Printf("Erro ao obter informações do arquivo '%s': %v\n", baseFileName, err)
-		return
-	}
-
-	// Envia o tamanho do arquivo ao cliente
-	fileSize := fileInfoStat.Size()
-	fmt.Fprintf(conn, "%d\n", fileSize)
-
-	// Envia o conteúdo do arquivo
-	_, err = io.Copy(conn, file)
-	if err != nil {
-		fmt.Fprintf(conn, "ERROR: Erro ao enviar o arquivo: %v\n", err)
-		fmt.Printf("Erro ao enviar o arquivo '%s': %v\n", baseFileName, err)
-		return
-	}
-
-	fmt.Printf("Download do arquivo '%s' concluído com sucesso.\n", baseFileName)
 }
 
 func handleClient(conn net.Conn) {
-	defer conn.Close()
+	for conn != nil {
+		buf := make([]byte, 1024) // Buffer para leitura de dados
+		n, err := conn.Read(buf)
+		if err != nil {
+			fmt.Println("Erro ao ler do cliente:", err)
+			return
+		}
 
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil {
-		fmt.Println("Erro ao ler do cliente:", err)
-		return
-	}
+		// Extrai e trata a mensagem recebida do cliente
+		input := strings.TrimSpace(string(buf[:n]))
+		parts := strings.Split(input, " ")
+		if len(parts) < 2 {
+			fmt.Fprintf(conn, "Comando inválido\n")
+			return
+		}
 
-	input := strings.TrimSpace(string(buf[:n]))
-	parts := strings.Split(input, " ")
-	if len(parts) < 2 {
-		fmt.Fprintf(conn, "Comando inválido\n")
-		return
-	}
+		command, fileName := parts[0], parts[1]
 
-	command, fileName := parts[0], parts[1]
-
-	switch command {
-	case "UPLOAD":
-		handleUpload(conn, fileName)
-	case "DOWNLOAD":
-		handleDownload(conn, fileName)
-	default:
-		fmt.Fprintf(conn, "Comando inválido\n")
+		// Processa o comando recebido
+		switch command {
+		case "UPLOAD":
+			handleUpload(conn, fileName)
+		case "DOWNLOAD":
+			handleDownload(conn, fileName)
+		case "CLOSE":
+			conn.Close()
+		default:
+			fmt.Fprintf(conn, "Comando inválido\n")
+		}
 	}
 }
 
 func registerWithMaster() {
-	conn, err := net.Dial("tcp", coordinatorIP+":8080")
+	conn, err := net.Dial("tcp", coordinatorIP+":8081")
 	if err != nil {
 		fmt.Println("Erro ao conectar ao nó coordenador:", err)
 		return
@@ -137,7 +109,7 @@ func registerWithMaster() {
 	defer conn.Close()
 
 	nodeID := "SuperNode1"
-	nodeAddr := "192.168.100.52:8081" // IP da máquina super nó (modifique para o IP correto)
+	nodeAddr := "172.26.4.202:8081" // IP da máquina super nó (modifique para o IP correto)
 	fmt.Fprint(conn, nodeID+" "+nodeAddr)
 	fmt.Println("SuperNode registrado no coordenador.")
 }
@@ -162,7 +134,7 @@ func checkCoordinator() {
 	for {
 		time.Sleep(5 * time.Second)
 
-		conn, err := net.Dial("tcp", coordinatorIP+":8080")
+		conn, err := net.Dial("tcp", coordinatorIP+":8081")
 		if err != nil {
 			fmt.Println("Coordenador não está respondendo. Iniciando eleição...")
 			startElection()
