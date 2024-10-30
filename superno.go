@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"strings"
@@ -10,33 +11,45 @@ import (
 )
 
 var (
-	files         = make(map[string]string) // Armazena o nome do arquivo e o IP do cliente que o possui
+	files         = make(map[string]map[string]bool) // Armazena o nome do arquivo e os IPs dos clientes que o possuem
 	superNodeID   = "SuperNode1"
-	coordinatorIP = "172.26.4.220" // IP do master_node (modifique para o IP correto)
+	coordinatorIP = "172.26.4.150" // IP do master_node (modifique para o IP correto)
 	coordinatorID = "Master"
 	allSuperNodes = []string{"SuperNode1", "SuperNode2", "SuperNode3"}
 
 	mu sync.Mutex // Protege o mapa contra condições de corrida
 )
 
+// Remove todos os arquivos pertencentes a um cliente desconectado
+func removeClientFiles(clientIP string) {
+	mu.Lock()
+	defer mu.Unlock()
+	for fileName, clients := range files {
+		if clients[clientIP] {
+			delete(clients, clientIP)
+			fmt.Printf("Cliente %s removido do mapa para o arquivo '%s'.\n", clientIP, fileName)
+			if len(clients) == 0 {
+				delete(files, fileName) // Remove a entrada do arquivo se nenhum cliente o possuir
+			}
+		}
+	}
+}
+
 func handleUpload(conn net.Conn, fileName string) {
 	baseFileName := filepath.Base(fileName)
-
-	// Captura o IP do cliente
 	ipClient := strings.Split(conn.RemoteAddr().String(), ":")[0]
 
-	// Log para rastrear o início do upload
 	fmt.Printf("Iniciando upload do arquivo '%s' do cliente %s\n", baseFileName, ipClient)
 
-	// Bloqueia o acesso ao mapa antes de modificar
 	mu.Lock()
-	files[baseFileName] = ipClient // Armazena o IP do cliente, substituindo o valor antigo (se houver)
-	mu.Unlock() // Desbloqueia o mapa após a modificação
+	if files[baseFileName] == nil {
+		files[baseFileName] = make(map[string]bool)
+	}
+	files[baseFileName][ipClient] = true
+	mu.Unlock()
 
-	// Exibe os arquivos armazenados para conferência
 	fmt.Printf("Arquivo '%s' registrado com o cliente %s. Estado atual dos arquivos: %v\n", baseFileName, ipClient, files)
 
-	// Envia a confirmação de upload para o cliente e verifica se houve erro
 	if _, err := fmt.Fprintf(conn, "Upload registrado no super nó.\n"); err != nil {
 		fmt.Printf("Erro ao enviar resposta de confirmação ao cliente %s: %v\n", ipClient, err)
 		return
@@ -46,47 +59,64 @@ func handleUpload(conn net.Conn, fileName string) {
 }
 
 func handleDownload(conn net.Conn, fileName string) {
-
 	baseFileName := filepath.Base(fileName)
+	requestingIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
 
-	// Bloqueia o acesso ao mapa antes de ler
 	mu.Lock()
-	ipClient, exists := files[baseFileName] // Pega o IP do cliente que possui o arquivo
-	mu.Unlock()
-
-	if !exists {
-		// Verifica se o arquivo está registrado
+	clients, exists := files[baseFileName]
+	if !exists || len(clients) == 0 {
+		mu.Unlock()
 		fmt.Fprintf(conn, "ERROR: Arquivo '%s' não encontrado\n", baseFileName)
 		fmt.Printf("Arquivo '%s' solicitado, mas não encontrado no servidor.\n", baseFileName)
 		return
 	}
 
-	// Envia o IP do cliente que possui o arquivo
+	// Pega o primeiro cliente que possui o arquivo para enviar seu IP
+	var ipClient string
+	for clientIP := range clients {
+		ipClient = clientIP
+		break
+	}
+
+	// Adiciona o IP do cliente solicitante ao mapa, indicando que ele agora possui o arquivo
+	files[baseFileName][requestingIP] = true
+	mu.Unlock()
+
 	fmt.Fprintf(conn, "O arquivo '%s' está disponível no cliente com IP: %s\n", baseFileName, ipClient)
 	fmt.Printf("Informações do arquivo '%s' enviadas para o cliente solicitante.\n", baseFileName)
-
 }
 
 func handleClient(conn net.Conn) {
+	clientIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
+
+	defer func() {
+		// Remove os arquivos do cliente ao desconectar
+		fmt.Printf("Cliente %s desconectado, removendo seus arquivos.\n", clientIP)
+		removeClientFiles(clientIP)
+		conn.Close()
+	}()
+
 	for conn != nil {
-		buf := make([]byte, 1024) // Buffer para leitura de dados
+		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
 		if err != nil {
-			fmt.Println("Erro ao ler do cliente:", err)
+			if err == io.EOF {
+				fmt.Printf("Conexão encerrada pelo cliente %s\n", clientIP)
+			} else {
+				fmt.Println("Erro ao ler do cliente:", err)
+			}
 			return
 		}
 
-		// Extrai e trata a mensagem recebida do cliente
 		input := strings.TrimSpace(string(buf[:n]))
 		parts := strings.Split(input, " ")
 		if len(parts) < 2 {
 			fmt.Fprintf(conn, "Comando inválido\n")
-			return
+			continue
 		}
 
 		command, fileName := parts[0], parts[1]
 
-		// Processa o comando recebido
 		switch command {
 		case "UPLOAD":
 			handleUpload(conn, fileName)
@@ -94,6 +124,7 @@ func handleClient(conn net.Conn) {
 			handleDownload(conn, fileName)
 		case "CLOSE":
 			conn.Close()
+			return
 		default:
 			fmt.Fprintf(conn, "Comando inválido\n")
 		}
@@ -109,7 +140,7 @@ func registerWithMaster() {
 	defer conn.Close()
 
 	nodeID := "SuperNode1"
-	nodeAddr := "172.26.4.202:8081" // IP da máquina super nó (modifique para o IP correto)
+	nodeAddr := "172.26.4.202:8081"
 	fmt.Fprint(conn, nodeID+" "+nodeAddr)
 	fmt.Println("SuperNode registrado no coordenador.")
 }
@@ -146,12 +177,9 @@ func checkCoordinator() {
 }
 
 func main() {
-
-	// go checkCoordinator()
-	// Iniciar coordenador
 	registerWithMaster()
 
-	ln, err := net.Listen("tcp", "0.0.0.0:8081") // Permitindo conexões externas
+	ln, err := net.Listen("tcp", "0.0.0.0:8081")
 	if err != nil {
 		fmt.Println("Erro ao iniciar o super nó:", err)
 		return
