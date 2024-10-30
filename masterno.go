@@ -16,7 +16,7 @@ type SuperNode struct {
 
 var (
 	superNodes     = make(map[int]SuperNode)
-	contSuperNodes = 3
+	contSuperNodes = 1
 	contToSucess   = 0
 	mu             sync.Mutex
 )
