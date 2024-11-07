@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,26 +18,27 @@ type SuperNode struct {
 }
 
 const (
-	registerPort   = ":8080"
-	releasePort    = ":8081"
-	clientPort     = ":8082"
-	broadcastPort  = ":8084"
+	registerPort  = ":8080"
+	releasePort   = ":8081"
+	clientPort    = ":8082"
+	broadcastPort = ":8084"
+	electionPort  = ":8085"
 )
 
 var (
-	isMaster = false
+	isMaster = true
 	mu       sync.Mutex
 
 	superNodes     = make(map[int]SuperNode)
 	contSuperNodes = 0
 	contToSucess   = 0
 
-	files           = make(map[string]map[string]bool)
-	superNodeID     = ""
-	coordinatorIP   = "172.27.3.241" // IP do master_node
-	coordinatorID   = "Master"
-	knownSuperNodes = []string{} // IPs dos SuperNodes
-	
+	files              = make(map[string]map[string]bool)
+	superNodeID        = ""
+	coordinatorIP      = "172.27.3.241" // IP do master_node
+	coordinatorID      = "Master"
+	knownSuperNodes    = []string{} // IPs dos SuperNodes
+	electionInProgress = false
 )
 
 func handleSuperNodeRegistration(conn net.Conn, nodeId int) {
@@ -293,6 +295,11 @@ func handleClient(conn net.Conn) {
 	}()
 
 	for conn != nil {
+		if isMaster {
+			conn.Close()
+			return
+		}
+
 		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
 		if err != nil {
@@ -375,24 +382,130 @@ func registerWithMaster() {
 	return
 }
 
-func startElection() {
-	fmt.Println("Iniciando eleição do valentão...")
+func handleElection() {
+	ln, _ := net.Listen("tcp", electionPort)
+	defer ln.Close()
+	for electionInProgress {
+		conn, err := ln.Accept()
+		if err != nil {
+			print("erro ao receber mensagem de um superno")
+		}
 
-	highestID := superNodeID
-	for _, nodeID := range knownSuperNodes {
-		if nodeID > highestID {
-			highestID = nodeID
+		response := make([]byte, 1024)
+		n, err := conn.Read(response)
+		if err != nil {
+			fmt.Println("Erro ao ler resposta de eleição:", err)
+			continue
+		}
+		// Tratamento da mensagem de eleição
+		idNode := int(strings.TrimSpace(string(response[:n]))[1])
+		myId, _ := strconv.Atoi(superNodeID)
+		fmt.Println("\n" + string(response[:n]) + "\n")
+		//fmt.Printf("\nRecebido %d do superno %s\n", idNode, conn.RemoteAddr().String())
+
+		if idNode > myId {
+			fmt.Fprint(conn, "OUT")
+
+		} else {
+			fmt.Fprint(conn, "OK")
+		}
+		_ = conn.Close()
+	}
+}
+
+func startElection() {
+	mu.Lock()
+	if electionInProgress {
+		mu.Unlock()
+		return
+	}
+	electionInProgress = true
+	mu.Unlock()
+
+	go handleElection()
+
+	fmt.Println("Iniciando eleição...")
+	electionDone := false
+
+	// Envia mensagem de eleição para nós com IDs maiores
+	nodeID, _ := strconv.Atoi(superNodeID)
+	for id := nodeID + 1; id < len(knownSuperNodes); id++ {
+		nodeAddr := knownSuperNodes[id]
+		if nodeAddr == "" {
+			continue
+		}
+
+		// Conecta ao nó de ID maior
+		conn, err := net.Dial("tcp", nodeAddr+electionPort)
+		if err != nil {
+			fmt.Printf("Nó %d (%s) não respondeu. Continuando eleição...\n", id, nodeAddr)
+			continue
+		}
+		defer conn.Close()
+
+		// Envia mensagem de eleição
+		_, err = fmt.Fprintf(conn, "ELECTION %d\n", superNodeID)
+		if err != nil {
+			fmt.Println("Erro ao enviar mensagem de eleição:", err)
+			continue
+		}
+
+		// Lê resposta do nó de ID maior
+		response := make([]byte, 1024)
+		n, err := conn.Read(response)
+		if err != nil {
+			fmt.Println("Erro ao ler resposta de eleição:", err)
+			continue
+		}
+
+		// Se resposta for "OK", outro nó participará da eleição
+		resp := strings.TrimSpace(string(response[:n]))
+		if resp == "OK" {
+			electionDone = true
 		}
 	}
 
-	if highestID == superNodeID {
-		fmt.Println("SuperNode venceu a eleição e se tornou o novo coordenador.")
-		coordinatorID = superNodeID
+	// Se nenhum nó respondeu, o nó assume a posição de coordenador
+	if !electionDone {
+		declareAsCoordinator()
 	}
+}
+
+func declareAsCoordinator() {
+	mu.Lock()
+	nodeID, _ := strconv.Atoi(superNodeID)
+	coordinatorIP = superNodes[nodeID].Addr
+	electionInProgress = false
+	isMaster = true
+
+	mu.Unlock()
+	fmt.Printf("Nó %s agora é o novo coordenador\n", superNodeID)
+	for _, superNode := range superNodes {
+		if superNode.Addr == coordinatorIP {
+			continue
+		}
+
+		conn, err := net.Dial("tcp", superNode.Addr+broadcastPort)
+		if err != nil {
+			fmt.Printf("Erro ao conectar ao SuperNode %d para informar novo coordenador: %v\n", superNode.ID, err)
+			continue
+		}
+
+		_, err = fmt.Fprintf(conn, "COORDINATOR %s\n", coordinatorIP)
+		if err != nil {
+			fmt.Printf("Erro ao enviar mensagem de novo coordenador para SuperNode %d: %v\n", superNode.ID, err)
+		}
+		_ = conn.Close()
+	}
+
+	initializeNode()
 }
 
 func checkCoordinator() {
 	for {
+		if isMaster {
+			return
+		}
 		time.Sleep(5 * time.Second)
 
 		conn, err := net.Dial("tcp", coordinatorIP+registerPort)
@@ -407,7 +520,7 @@ func checkCoordinator() {
 }
 
 func awaitMasterRelease() bool {
-	ln, err := net.Listen("tcp", releasePort) 
+	ln, err := net.Listen("tcp", releasePort)
 	if err != nil {
 		fmt.Println("Erro ao iniciar listener para receber liberação do coordenador:", err)
 		return false
@@ -442,6 +555,9 @@ func awaitMasterRelease() bool {
 
 func receiveBroadcast() {
 	for {
+		if isMaster {
+			return
+		}
 		ln, err := net.Listen("tcp", broadcastPort)
 
 		if err != nil {
@@ -465,58 +581,75 @@ func receiveBroadcast() {
 			return
 		}
 
-		// Armazena a lista de super nós conhecidos
-		mu.Lock()
-		knownSuperNodes = strings.Split(strings.TrimSpace(string(buf[:n])), ",")
-		mu.Unlock()
+		if strings.Contains(string(buf[:n]), "COORDINATOR") {
+			coordinatorIP = strings.Split(string(buf[:n]), " ")[1]
+		} else {
+			// Armazena a lista de super nós conhecidos
+			mu.Lock()
+			knownSuperNodes = strings.Split(strings.TrimSpace(string(buf[:n])), ",")
+			mu.Unlock()
+		}
 
 		fmt.Printf("SuperNode recebeu lista de super nós: %v\n", knownSuperNodes)
 
 	}
 }
 
-func initializeNode() {
-	if isMaster {
-		ln, err := net.Listen("tcp", registerPort)
-		if err != nil {
-			fmt.Println("Erro ao iniciar o servidor de registro:", err)
-			return
-		}
-
-		fmt.Println("Nó coordenador aguardando registros dos super nós...")
-
-		for contSuperNodes < 3 {
-			conn, err := ln.Accept()
+func listnerOtherNodes(listener net.Listener) {
+	for {
+		time.Sleep(1 * time.Second)
+		conn, err := listener.Accept()
+		nodeAddress := strings.Split(conn.RemoteAddr().String(), ":")[0]
+		exist := addressAlreadyExist(nodeAddress)
+		if !exist {
 			if err != nil {
 				fmt.Println("Erro ao aceitar conexão de registro:", err)
 				continue
 			}
 			go handleSuperNodeRegistration(conn, contSuperNodes)
+			time.Sleep(5 * time.Second)
+			freeNode(superNodes[contSuperNodes])
 			contSuperNodes++
+			broadcastSuperNodes()
 		}
+		defer conn.Close()
+	}
+}
 
-		go freeSuperNodes() // Executa freeSuperNodes em goroutine para evitar bloqueio
-		time.Sleep(6 * time.Second)
-		go broadcastSuperNodes()
+func initializeNode() {
+	if isMaster {
+		if len(superNodes) > 0 {
+			ln, err := net.Listen("tcp", registerPort)
+			if err != nil {
+				fmt.Println("Erro ao iniciar o servidor de registro:", err)
+				return
+			}
+			listnerOtherNodes(ln)
+		} else {
+			ln, err := net.Listen("tcp", registerPort)
+			if err != nil {
+				fmt.Println("Erro ao iniciar o servidor de registro:", err)
+				return
+			}
 
-		defer ln.Close()
-		for {
-			time.Sleep(1 * time.Second)
-			conn, err := ln.Accept()
-			nodeAddress := strings.Split(conn.RemoteAddr().String(), ":")[0]
-			exist := addressAlreadyExist(nodeAddress)
-			if !exist {
+			fmt.Println("Nó coordenador aguardando registros dos super nós...")
+
+			for contSuperNodes < 3 {
+				conn, err := ln.Accept()
 				if err != nil {
 					fmt.Println("Erro ao aceitar conexão de registro:", err)
 					continue
 				}
 				go handleSuperNodeRegistration(conn, contSuperNodes)
-				time.Sleep(5 * time.Second)
-				freeNode(superNodes[contSuperNodes])
 				contSuperNodes++
-				broadcastSuperNodes()
 			}
+
+			go freeSuperNodes() // Executa freeSuperNodes em goroutine para evitar bloqueio
+			time.Sleep(6 * time.Second)
+			broadcastSuperNodes()
+			listnerOtherNodes(ln)
 		}
+
 	} else {
 		registerWithMaster()
 		released := false
