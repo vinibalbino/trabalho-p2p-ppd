@@ -11,6 +11,11 @@ import (
 	"strings"
 )
 
+const (
+	clientPort  = ":8081"
+	supernoPort = ":8082"
+)
+
 // Função para servir arquivos que o cliente possui para outros clientes
 func handleClientRequest(conn net.Conn) {
 	defer conn.Close()
@@ -92,7 +97,7 @@ func downloadFile(superNodeConn net.Conn, fileName string) error {
 	fmt.Printf("Iniciando download do arquivo '%s' do cliente %s\n", fileName, ipClient)
 
 	// Conecta ao cliente que possui o arquivo
-	clientConn, err := net.Dial("tcp", ipClient+":8082") // Porta onde o cliente está aguardando
+	clientConn, err := net.Dial("tcp", ipClient+clientPort) // Porta onde o cliente está aguardando
 	if err != nil {
 		return fmt.Errorf("Erro ao conectar ao cliente: %v", err)
 	}
@@ -173,7 +178,7 @@ func handleUserInteraction(superNodeConn net.Conn) {
 }
 
 func startClientServer() {
-	ln, err := net.Listen("tcp", ":8082") // Escutando na porta 8082
+	ln, err := net.Listen("tcp", clientPort) // Escutando na porta 8082
 	if err != nil {
 		fmt.Println("Erro ao iniciar o servidor do cliente:", err)
 		return
@@ -197,8 +202,8 @@ func main() {
 	go startClientServer()
 
 	// Conecta ao super nó (mantém a conexão aberta)
-	superNodeConn, err := net.Dial("tcp", "172.26.4.202:8081") // IP do super nó (modifique para o IP correto)
-	if err != nil {
+	superNodeConn, err := net.Dial("tcp", "172.26.1.249"+ supernoPort) // IP do super nó (modifique para o IP correto)
+	if err != nil { 
 		fmt.Println("Erro ao conectar ao super nó:", err)
 		return
 	}
