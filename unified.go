@@ -26,7 +26,7 @@ const (
 )
 
 var (
-	isMaster = true
+	isMaster = false
 	mu       sync.Mutex
 
 	superNodes     = make(map[int]SuperNode)
@@ -188,7 +188,7 @@ func handleUpload(conn net.Conn, fileName string) {
 // Função para fazer broadcast aos demais super nós em busca do arquivo
 func broadcastRequest(fileName string) (string, bool) {
 	for _, superNodeAddr := range knownSuperNodes {
-		conn, err := net.Dial("tcp", superNodeAddr)
+		conn, err := net.Dial("tcp", superNodeAddr+clientPort)
 		if err != nil {
 			fmt.Printf("Erro ao conectar ao SuperNode %s: %v\n", superNodeAddr, err)
 			continue
@@ -386,6 +386,7 @@ func handleElection() {
 	ln, _ := net.Listen("tcp", electionPort)
 	defer ln.Close()
 	for electionInProgress {
+		mu.Lock()
 		conn, err := ln.Accept()
 		if err != nil {
 			print("erro ao receber mensagem de um superno")
@@ -398,10 +399,10 @@ func handleElection() {
 			continue
 		}
 		// Tratamento da mensagem de eleição
-		idNode := int(strings.TrimSpace(string(response[:n]))[1])
+		idNode, _ := strconv.Atoi(strings.Split(string(response[:n]), " ")[1])
 		myId, _ := strconv.Atoi(superNodeID)
 		fmt.Println("\n" + string(response[:n]) + "\n")
-		//fmt.Printf("\nRecebido %d do superno %s\n", idNode, conn.RemoteAddr().String())
+		fmt.Printf("\nRecebido %d do superno %s\n", idNode, conn.RemoteAddr().String())
 
 		if idNode > myId {
 			fmt.Fprint(conn, "OUT")
@@ -410,6 +411,7 @@ func handleElection() {
 			fmt.Fprint(conn, "OK")
 		}
 		_ = conn.Close()
+		mu.Unlock()
 	}
 }
 
@@ -429,6 +431,7 @@ func startElection() {
 
 	// Envia mensagem de eleição para nós com IDs maiores
 	nodeID, _ := strconv.Atoi(superNodeID)
+	
 	for id := nodeID + 1; id < len(knownSuperNodes); id++ {
 		nodeAddr := knownSuperNodes[id]
 		if nodeAddr == "" {
@@ -444,7 +447,7 @@ func startElection() {
 		defer conn.Close()
 
 		// Envia mensagem de eleição
-		_, err = fmt.Fprintf(conn, "ELECTION %d\n", superNodeID)
+		_, err = fmt.Fprintf(conn, "ELECTION %d\n", nodeID)
 		if err != nil {
 			fmt.Println("Erro ao enviar mensagem de eleição:", err)
 			continue
@@ -464,7 +467,7 @@ func startElection() {
 			electionDone = true
 		}
 	}
-
+	time.Sleep(9*time.Second)
 	// Se nenhum nó respondeu, o nó assume a posição de coordenador
 	if !electionDone {
 		declareAsCoordinator()
@@ -492,6 +495,7 @@ func declareAsCoordinator() {
 		}
 
 		_, err = fmt.Fprintf(conn, "COORDINATOR %s\n", coordinatorIP)
+		fmt.Println(coordinatorIP)
 		if err != nil {
 			fmt.Printf("Erro ao enviar mensagem de novo coordenador para SuperNode %d: %v\n", superNode.ID, err)
 		}
@@ -510,11 +514,10 @@ func checkCoordinator() {
 
 		conn, err := net.Dial("tcp", coordinatorIP+registerPort)
 		if err != nil {
-			fmt.Println("Coordenador não está respondendo. Iniciando eleição...")
+			fmt.Println("Coordenador não está respondendo.")
 			startElection()
 		} else {
 			defer conn.Close()
-			fmt.Println("Coordenador está ativo.")
 		}
 	}
 }
@@ -583,6 +586,7 @@ func receiveBroadcast() {
 
 		if strings.Contains(string(buf[:n]), "COORDINATOR") {
 			coordinatorIP = strings.Split(string(buf[:n]), " ")[1]
+			fmt.Println(coordinatorIP)
 		} else {
 			// Armazena a lista de super nós conhecidos
 			mu.Lock()
